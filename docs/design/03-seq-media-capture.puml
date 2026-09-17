@@ -1,0 +1,155 @@
+@startuml 03-seq-media-capture
+' ============================================================
+'  Media capture pipeline — crash-resilient by design.
+'  The DB row is written BEFORE compression starts, so an
+'  app kill mid-encode leaves a recoverable state, not debris.
+' ============================================================
+
+title Media Pipeline — Capture, Compress, Thumbnail (60s hard cap)
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam sequence {
+  ArrowColor #444444
+  LifeLineBorderColor #999999
+  ParticipantBorderColor #444444
+  ParticipantBackgroundColor #FFFFFF
+}
+
+actor User
+participant "CaptureScreen" as UI
+participant "CaptureService" as Capture
+participant "MediaRepositoryImpl" as Repo
+participant "MediaLocalDataSource" as Local
+database "Drift / SQLite" as DB
+participant "CompressionWorker\n«Isolate»" as Worker
+participant "Platform Encoder\nMediaCodec / AVAssetExportSession" as Encoder
+participant "ThumbnailGenerator" as Thumbs
+folder "App Documents\nmedia/ · thumbs/ · cache/compress/" as FS
+
+== Capture ==
+
+User -> UI : tap record
+activate UI
+UI -> Capture : startVideo(maxDuration: 60s)
+activate Capture
+Capture -> UI : countdown ring
+note right of Capture
+  60s cap enforced **at capture**
+  with auto-stop — never by
+  trimming afterwards.
+end note
+User -> UI : tap stop (or auto-stop at 60s)
+UI -> Capture : stop()
+Capture -> FS : write raw → cache/compress/<uuid>.tmp
+activate FS
+FS --> Capture : tmp path
+deactivate FS
+Capture --> UI : rawRef
+deactivate Capture
+
+== Persist BEFORE processing ==
+
+UI -> Repo : registerCapture(rawRef, sessionId, exerciseLogId?)
+activate Repo
+Repo -> Repo : uuidV7(), sha256(raw),\nrelative_path = media/yyyy/MM/<uuid>.mp4
+Repo -> Local : upsert(row, capture_state: captured)
+activate Local
+Local -> DB : INSERT media_attachments
+activate DB
+DB --> Local : ok
+deactivate DB
+deactivate Local
+Repo --> UI : Ok(attachmentId)
+deactivate Repo
+
+DB -->> UI : gallery stream emits\n(placeholder tile, "processing")
+
+note over Repo, DB #F0FFF0
+  **Row exists before any heavy work.**
+  If the OS kills the app now, the orphan
+  sweeper finds a `captured` row with a
+  missing output and can retry or clean up.
+end note
+
+== Compress off the UI thread ==
+
+Repo -> Worker : enqueue(attachmentId)
+activate Worker
+Worker -> Local : markState(compressing)
+activate Local
+Local -> DB : UPDATE capture_state
+deactivate Local
+
+Worker -> Encoder : encode(tmp → H.264 720p30 ~2.2 Mbps,\nAAC 96 kbps mono)
+activate Encoder
+
+alt encode succeeds
+  Encoder --> Worker : encoded bytes
+  deactivate Encoder
+  Worker -> FS : write media/yyyy/MM/<uuid>.mp4
+  activate FS
+  FS --> Worker : ok
+  deactivate FS
+
+  Worker -> Thumbs : frameAt(1s) → WebP q70, 320px
+  activate Thumbs
+  Thumbs -> FS : write thumbs/yyyy/MM/<uuid>.webp
+  Thumbs --> Worker : thumb path
+  deactivate Thumbs
+
+  Worker -> Local : update(size, width, height,\nduration_ms, thumb_rel_path,\ncapture_state: ready)
+  activate Local
+  Local -> DB : UPDATE
+  activate DB
+  DB --> Local : ok
+  deactivate DB
+  deactivate Local
+
+  Worker -> FS : delete cache/compress/<uuid>.tmp
+  DB -->> UI : gallery stream emits → real thumbnail
+
+else encode fails
+  Encoder --> Worker : error
+  Worker -> Local : markState(failed), retryCount++
+  activate Local
+  Local -> DB : UPDATE
+  deactivate Local
+  alt retryCount < 3
+    Worker -> Worker : re-enqueue with backoff
+  else exhausted
+    DB -->> UI : tile shows "couldn't process — retry / discard"
+  end
+end
+deactivate Worker
+deactivate UI
+
+== Housekeeping (app launch) ==
+
+group Orphan sweep
+  participant "OrphanSweeper" as Sweep
+  Sweep -> FS : enumerate media/ + thumbs/
+  Sweep -> DB : SELECT live relative_path set
+  Sweep -> FS : delete files with no live row
+  Sweep -> FS : purge cache/compress/ older than 1h
+end
+
+group Storage budget
+  participant "StorageBudget" as Budget
+  Budget -> DB : SUM(size_bytes) WHERE deleted_at IS NULL
+  alt over budget (default 2 GB)
+    note right of Budget #FFF0F0
+      **First cut = local-only.**
+      Never evict silently — that is data loss.
+      Prompt the user, oldest-first.
+      (Post-backup: auto-evict originals
+      only where remote_url IS NOT NULL.)
+    end note
+  end
+  note right of Budget
+    Thumbnails are **never** evicted.
+    ~15 KB each — a decade fits in <40 MB.
+  end note
+end
+
+@enduml

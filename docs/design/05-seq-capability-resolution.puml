@@ -1,0 +1,148 @@
+@startuml 05-seq-capability-resolution
+' ============================================================
+'  Capability tiers in action.
+'  Tier 0 renders before any capability is even queried.
+' ============================================================
+
+title Capability Resolution — App Launch & Permission Lifecycle
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam sequence {
+  ArrowColor #444444
+  LifeLineBorderColor #999999
+  ParticipantBorderColor #444444
+  ParticipantBackgroundColor #FFFFFF
+}
+
+actor User
+participant "App bootstrap" as Boot
+participant "Dashboard" as UI
+participant "CapabilityRegistry" as CapReg
+participant "GoogleHealthApiSource" as GHA
+participant "HealthConnectSource\n«Phase 3+»" as HC
+participant "HealthKitSource\n«Phase 3+»" as HK
+database "Drift / SQLite" as DB
+
+== Launch — Tier 0 renders first, unconditionally ==
+
+Boot -> DB : open (background isolate)
+activate DB
+DB --> Boot : ready
+deactivate DB
+Boot -> UI : render
+activate UI
+UI -> DB : watch sessions, streaks, habits
+DB -->> UI : Tier 0 + Tier 1 data
+
+note over Boot, UI #F0FFF0
+  **Attendance, streaks and logging are on screen
+  before any capability is queried or any permission
+  dialog is considered.** Tier 0 depends on nothing.
+end note
+
+== Tier 2 resolved asynchronously, never blocking ==
+
+UI -> CapReg : statusFor(metrics)  «async, non-blocking»
+activate CapReg
+
+par per registered source
+  CapReg -> GHA : isAvailable()
+  activate GHA
+  GHA -> GHA : token present? account linked?
+  GHA --> CapReg : available | unavailable(reason)
+  deactivate GHA
+also
+  CapReg -> HC : isAvailable()
+  activate HC
+  HC -> HC : SDK status\n(unavailable / update required / ok)
+  HC --> CapReg : status
+  deactivate HC
+also
+  CapReg -> HK : isAvailable()
+  activate HK
+  HK --> CapReg : status
+  deactivate HK
+end
+
+CapReg -> CapReg : build per-metric map\n{metric → available | unavailable(reason)}
+CapReg --> UI : CapabilityMap
+deactivate CapReg
+
+alt metric available
+  UI -> DB : watch resolved snapshots
+  DB -->> UI : chart renders
+else metric unavailable
+  UI -> UI : render empty state **with reason**
+  note right of UI #FFF0F0
+    e.g. "Heart-rate zones need intraday data.
+    Your current source provides daily
+    summaries only."
+    Never a blank chart. Never a silent zero.
+  end note
+end
+deactivate UI
+
+== User connects a source (their choice, any time) ==
+
+User -> UI : Settings → Connect health source
+activate UI
+UI -> GHA : requestPermissions(metrics)
+activate GHA
+GHA -> GHA : OAuth 2.0 + PKCE\n(public client, external browser)
+GHA --> UI : granted | denied | partial
+deactivate GHA
+UI -> CapReg : invalidate()
+activate CapReg
+CapReg -> CapReg : re-resolve
+CapReg --> UI : updated CapabilityMap
+deactivate CapReg
+deactivate UI
+
+== Permissions are revocable and auto-expire ==
+
+group Before every read
+  participant "HealthSyncCoordinator" as Coord
+  Coord -> CapReg : statusFor(metric)
+  activate CapReg
+  CapReg -> GHA : isAvailable()
+  activate GHA
+  alt revoked or token invalid
+    GHA --> CapReg : unavailable(reason: revoked)
+    deactivate GHA
+    CapReg --> Coord : unavailable
+    Coord -> UI : degrade to "Reconnect" card
+    note right of Coord #FFF0F0
+      **Never cache "granted" as durable state.**
+      Permissions are revocable at any time and are
+      auto-revoked after extended non-use.
+      Degrade gracefully — never throw a dialog.
+    end note
+  else still granted
+    CapReg --> Coord : available → proceed
+  end
+  deactivate CapReg
+end
+
+== User configures priority (per source, or per metric) ==
+
+User -> UI : Settings → Data sources
+activate UI
+UI -> DB : SELECT source_priority
+DB --> UI : ranked list
+User -> UI : drag to reorder  «simple view»
+opt advanced view
+  User -> UI : override rank for a specific metric
+end
+UI -> DB : UPDATE source_priority(metric, source_id, rank)
+DB -->> UI : resolver re-runs, dashboard updates
+deactivate UI
+
+note over User, DB #FFFDF0
+  Defaults ship sensibly ranked.
+  Per-metric override is available but tucked
+  behind an advanced view — the primary control
+  is one drag-to-reorder source list.
+end note
+
+@enduml

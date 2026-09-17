@@ -1,0 +1,186 @@
+@startuml 04-seq-health-sync
+' ============================================================
+'  Phase 2 — background health sync.
+'  Multi-source ready from day one even though only
+'  GoogleHealthApiSource is registered at first.
+' ============================================================
+
+title Health Sync — Background Ingestion & Per-Metric Source Resolution (Phase 2)
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam sequence {
+  ArrowColor #444444
+  LifeLineBorderColor #999999
+  ParticipantBorderColor #444444
+  ParticipantBackgroundColor #FFFFFF
+}
+
+participant "WorkManager\n«OS scheduler»" as WM
+participant "HealthSyncCoordinator" as Coord
+participant "CapabilityRegistry" as CapReg
+participant "SourcePriorityResolver" as Priority
+participant "GoogleHealthApiSource\n«HealthDataSource»" as Source
+participant "TokenStore\nsecure_storage" as Tokens
+cloud "Google Health API\nv4" as API
+participant "Per-source Mapper\nvendor → canonical" as Mapper
+participant "HealthLocalDataSource" as Local
+database "Drift / SQLite" as DB
+participant "SnapshotResolver" as Resolver
+participant "UI\n«via stream»" as UI
+
+== Trigger ==
+
+WM -> Coord : doWork()  «periodic, constraints: network»
+activate Coord
+
+Coord -> CapReg : statusFor(all metrics)
+activate CapReg
+CapReg -> Source : isAvailable()
+activate Source
+Source --> CapReg : available
+deactivate Source
+CapReg --> Coord : {steps: ok, hr: ok, sleep: ok, ...}
+deactivate CapReg
+
+alt no source available
+  Coord -> Coord : record attempt, exit cleanly
+  note right of Coord
+    Never surfaces a modal.
+    UI shows last-known-good
+    with a staleness indicator.
+  end note
+end
+
+Coord -> Priority : orderedSourcesFor(metric)
+activate Priority
+Priority -> DB : SELECT * FROM source_priority\nWHERE metric = ? ORDER BY rank
+activate DB
+DB --> Priority : [google_health]
+deactivate DB
+Priority --> Coord : ranked source list
+deactivate Priority
+
+note right of Priority
+  One row per metric today.
+  Adding Health Connect / HealthKit
+  later is a **config change**, not code.
+end note
+
+== Fetch cursor ==
+
+Coord -> Local : cursorFor('google_health')
+activate Local
+Local -> DB : SELECT cursor, consecutive_failures\nFROM sync_cursors
+DB --> Local : cursor
+Local --> Coord : cursor
+deactivate Local
+
+== Authenticated read ==
+
+Coord -> Source : read(from, to, cursor)
+activate Source
+Source -> Tokens : accessToken()
+activate Tokens
+Tokens --> Source : token (may be expired)
+deactivate Tokens
+
+Source -> API : GET /v4/... (paginated)
+activate API
+
+alt 401 Unauthorized
+  API --> Source : 401
+  Source -> Tokens : refresh()
+  activate Tokens
+  Tokens -> API : POST token endpoint (refresh_token)
+  API --> Tokens : new access + refresh
+  Tokens --> Source : new token
+  deactivate Tokens
+  Source -> API : retry request
+end
+
+alt 429 / 5xx
+  API --> Source : error
+  Source --> Coord : Err(NetworkFailure)
+  Coord -> Local : recordFailure('google_health')
+  Local -> DB : UPDATE consecutive_failures++,\nnext_attempt = backoff(n)
+  note right of Coord #FFF0F0
+    Exponential backoff, capped ~6h.
+    Never a user-facing error dialog
+    for a background sync.
+  end note
+end
+
+loop while nextPageToken
+  API --> Source : page of records
+end
+deactivate API
+
+Source -> Mapper : normalise(vendorRecords)
+activate Mapper
+note right of Mapper
+  Vendor units, timezone handling,
+  sleep-stage taxonomy and session
+  enums are converted to the
+  **canonical model** here — the only
+  place vendor semantics may appear.
+end note
+Mapper --> Source : List<CanonicalHealthRecord>
+deactivate Mapper
+Source --> Coord : Ok(records, nextCursor)
+deactivate Source
+
+== Persist with DB-enforced dedup ==
+
+loop for each canonical record
+  Coord -> Local : upsertSnapshot(record)
+  activate Local
+  Local -> DB : INSERT ... ON CONFLICT\n(source_id, source_package, source_record_id)\nDO UPDATE
+  activate DB
+  DB --> Local : ok
+  deactivate DB
+  deactivate Local
+end
+
+note over Local, DB #F0FFF0
+  **Dedup is a unique index, not application logic.**
+  Re-reading an overlapping window is therefore
+  always safe and idempotent.
+end note
+
+Coord -> Local : setCursor('google_health', nextCursor)
+Local -> DB : UPDATE sync_cursors\n(cursor, last_success_at, failures = 0)
+
+== Resolve winner per metric ==
+
+Coord -> Resolver : resolve(dateRange)
+activate Resolver
+Resolver -> DB : SELECT * FROM health_snapshots\nWHERE local_date = ?  «one row PER SOURCE»
+activate DB
+DB --> Resolver : rows (1 today, N later)
+deactivate DB
+Resolver -> Priority : rank per metric
+Resolver -> Resolver : pick highest-ranked source\nwith data for each metric;\nfall through if absent
+Resolver -> Resolver : compute coverage\n(days with data / days in window)
+Resolver -> DB : write resolved view / materialised row
+Resolver --> Coord : resolved
+deactivate Resolver
+
+note right of Resolver
+  Resolution is **per metric**, not per source:
+  best HR from one source, best sleep from
+  another, on the same day.
+end note
+
+Coord -> Coord : derive HR zones from intraday samples\n+ user max HR, tag zone_model_version
+deactivate Coord
+
+DB -->> UI : Drift stream emits → dashboard updates
+
+note over WM, UI #FFFDF0
+  **The UI was never blocked and never awaited the network.**
+  Sync wrote into Drift; the UI watches Drift.
+  This is what makes a future backend additive.
+end note
+
+@enduml

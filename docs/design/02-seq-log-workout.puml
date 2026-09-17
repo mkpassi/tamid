@@ -1,0 +1,155 @@
+@startuml 02-seq-log-workout
+' ============================================================
+'  Core loop: log a workout session
+'  Demonstrates the structural rule — the write returns
+'  immediately; the UI updates via the Drift stream, NOT
+'  via the return value of the write.
+' ============================================================
+
+title Core Loop — Log a Workout Session (Tier 0/1, no health data)
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam sequence {
+  ArrowColor #444444
+  LifeLineBorderColor #999999
+  ParticipantBorderColor #444444
+  ParticipantBackgroundColor #FFFFFF
+}
+
+actor User
+participant "WorkoutScreen" as UI
+participant "sessionNotifier\n«Riverpod»" as Notifier
+participant "recentSessions\nProvider" as StreamProv
+participant "LogWorkout\n«UseCase»" as UseCase
+participant "WorkoutRepositoryImpl" as Repo
+participant "Clock / UuidV7" as Core
+participant "WorkoutLocalDataSource\n(BaseDao)" as Local
+database "Drift / SQLite\n«background isolate»" as DB
+
+== Subscription established on screen mount ==
+
+UI -> StreamProv : watch()
+activate StreamProv
+StreamProv -> Repo : watchSessions(from, to, limit, offset)
+activate Repo
+Repo -> Local : watch(...)
+activate Local
+Local -> DB : SELECT ... WHERE deleted_at IS NULL\nORDER BY started_at DESC LIMIT ? OFFSET ?
+activate DB
+DB --> Local : Stream<WorkoutSessionRow>
+Local --> Repo : Stream<Row>
+deactivate Local
+Repo --> StreamProv : Stream<WorkoutSession>\n«mapped to entities»
+deactivate Repo
+StreamProv --> UI : AsyncValue.data([...])
+deactivate StreamProv
+
+note over UI, DB
+  The stream stays open for the lifetime of the screen.
+  Every subsequent write re-emits automatically.
+end note
+
+== User starts a session ==
+
+User -> UI : tap "Start session"
+UI -> Notifier : startSession(type)
+activate Notifier
+Notifier -> UseCase : call(type)
+activate UseCase
+UseCase -> Repo : upsertSession(draft)
+activate Repo
+
+Repo -> Core : generate()
+activate Core
+Core --> Repo : UUIDv7
+deactivate Core
+Repo -> Core : nowUtcMillis()
+activate Core
+Core --> Repo : epoch ms
+deactivate Core
+
+note right of Repo
+  Repo also derives:
+  • local_date  (04:00 day boundary)
+  • tz_offset_min at capture
+  • device_id
+end note
+
+Repo -> Local : upsert(row, state: pending)
+activate Local
+Local -> Local : BaseDao: bump updated_at,\nreset sync_state
+Local -> DB : INSERT OR REPLACE (single txn)
+activate DB
+DB --> Local : ok
+deactivate DB
+Local --> Repo : void
+deactivate Local
+Repo --> UseCase : Ok(WorkoutSession)
+deactivate Repo
+UseCase --> Notifier : Ok(session)
+deactivate UseCase
+Notifier --> UI : state = active(sessionId)
+deactivate Notifier
+
+DB -->> Local : stream re-emits
+DB -->> StreamProv : ""
+StreamProv -->> UI : AsyncValue.data([new, ...])
+
+note over Repo, DB #F0FFF0
+  **Write path is fully local and atomic.**
+  No network, no await beyond SQLite.
+  Returns in single-digit milliseconds.
+end note
+
+== User logs sets ==
+
+loop for each set
+  User -> UI : enter reps / weight / RPE
+  UI -> Notifier : addSet(exerciseId, reps, weightKg, rpe)
+  activate Notifier
+  Notifier -> Repo : upsertExerciseLog(log)
+  activate Repo
+  Repo -> Local : upsert(row, state: pending)
+  activate Local
+  Local -> DB : INSERT (session_id, order_index, set_index, ...)
+  activate DB
+  DB --> Local : ok
+  deactivate DB
+  deactivate Local
+  Repo --> Notifier : Ok(log)
+  deactivate Repo
+  deactivate Notifier
+  DB -->> UI : stream re-emits → list updates
+end
+
+note right of DB
+  One row **per set**, not a JSON blob.
+  Enables SQL progression queries and
+  per-row LWW conflict resolution later.
+end note
+
+== User ends the session ==
+
+User -> UI : tap "Finish"
+UI -> Notifier : endSession()
+activate Notifier
+Notifier -> Repo : upsertSession(session with endedAt, status: completed)
+activate Repo
+Repo -> Local : upsert(row, state: pending)
+activate Local
+Local -> DB : UPDATE
+deactivate Local
+Repo --> Notifier : Ok
+deactivate Repo
+deactivate Notifier
+DB -->> UI : stream re-emits
+
+note over User, DB #FFFDF0
+  **Nothing in this flow touches health data, permissions,
+  the network, or any platform capability.**
+  This is Tier 0/1 — it must keep working with every
+  integration disabled or unavailable.
+end note
+
+@enduml

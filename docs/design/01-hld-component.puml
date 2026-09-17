@@ -1,0 +1,189 @@
+@startuml 01-hld-component
+' ============================================================
+'  Fitness & Habit Tracker — HLD Component Architecture
+'  First cut: local-first, no backend
+' ============================================================
+
+title Fitness & Habit Tracker — Component Architecture (First Cut)
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam ArrowColor #444444
+skinparam package {
+  BorderColor #666666
+  BackgroundColor #FAFAFA
+}
+skinparam component {
+  BorderColor #444444
+  BackgroundColor #FFFFFF
+}
+
+legend top right
+  |= Style |= Meaning |
+  | solid | dependency (compile-time) |
+  | dashed | reactive stream (runtime) |
+  | grey | deferred — not in first cut |
+endlegend
+
+' ------------------------------------------------------------
+package "PRESENTATION" #F0F6FF {
+  component "Screens\n(workout, history,\ndashboard, settings)" as Screens
+  component "Riverpod Providers\n@riverpod / AsyncNotifier" as Providers
+  component "Empty-state &\nError Catalogue" as EmptyStates
+}
+
+' ------------------------------------------------------------
+package "DOMAIN  «pure Dart — zero framework imports»" #F3FFF3 {
+  component "Entities\nWorkoutSession, ExerciseLog,\nMediaAttachment, HealthSnapshot" as Entities
+  component "Value Objects\nStreak, Weight, Rpe,\nHeartRateZone" as ValueObjects
+  interface "WorkoutRepository" as IWorkoutRepo
+  interface "MediaRepository" as IMediaRepo
+  interface "HealthRepository" as IHealthRepo
+  interface "HabitRepository" as IHabitRepo
+  component "Use Cases\nLogWorkout, ComputeStreak,\nResolveSnapshot" as UseCases
+}
+
+' ------------------------------------------------------------
+package "DATA" #FFF8F0 {
+
+  package "repositories" {
+    component "WorkoutRepositoryImpl" as WorkoutRepoImpl
+    component "MediaRepositoryImpl" as MediaRepoImpl
+    component "HealthRepositoryImpl" as HealthRepoImpl
+  }
+
+  package "local" {
+    component "Drift Database\n(background isolate)" as Drift
+    component "DAOs\nBaseDao enforces\ntombstone + updated_at" as DAOs
+    database "SQLite" as SQLite
+  }
+
+  package "health" {
+    interface "HealthDataSource" as IHealthSource
+    component "GoogleHealthApiSource\n«Phase 2»" as GHASource
+    component "HealthConnectSource\n«Phase 3+»" as HCSource
+    component "HealthKitSource\n«Phase 3+»" as HKSource
+    component "Per-source Mappers\nvendor → canonical" as HealthMappers
+    component "TokenStore\nflutter_secure_storage" as TokenStore
+  }
+
+  package "media" {
+    component "CaptureService\n60s cap enforced" as Capture
+    component "CompressionWorker\n(isolate)" as Compressor
+    component "ThumbnailGenerator" as Thumbs
+    component "MediaPathResolver\nrelative → absolute" as PathResolver
+    folder "App Documents\nmedia/ thumbs/" as FileStore
+  }
+
+  package "remote  «DOES NOT EXIST IN FIRST CUT»" #EEEEEE {
+    component "RemoteDataSources" as Remote #DDDDDD
+  }
+}
+
+' ------------------------------------------------------------
+package "CORE  «cross-cutting»" #FFFDF0 {
+  component "Clock\n«injected — DateTime.now() banned»" as Clock
+  component "UuidV7Generator" as Uuid
+  component "CapabilityRegistry\nper-metric availability" as CapReg
+  component "SourcePriorityResolver\nsource_priority table" as PriorityResolver
+  component "HealthSyncCoordinator\nWorkManager-scheduled" as SyncCoord
+  component "StorageBudget\n+ OrphanSweeper" as Storage
+  component "Failure hierarchy\n+ Result<T>" as Failure
+  component "ExportImportService" as Export
+}
+
+' ------------------------------------------------------------
+cloud "Google Health API\nhealth.googleapis.com/v4" as GoogleAPI
+node "Health Connect\n(on-device store)" as HealthConnect
+node "HealthKit\n(on-device store)" as HealthKit
+
+' ============================================================
+'  Dependencies
+' ============================================================
+Screens --> Providers
+Screens --> EmptyStates
+EmptyStates ..> CapReg
+Providers --> IWorkoutRepo
+Providers --> IMediaRepo
+Providers --> IHealthRepo
+Providers --> IHabitRepo
+Providers --> UseCases
+
+UseCases --> Entities
+UseCases --> ValueObjects
+UseCases --> IWorkoutRepo
+IWorkoutRepo --> Entities
+
+WorkoutRepoImpl ..|> IWorkoutRepo
+MediaRepoImpl ..|> IMediaRepo
+HealthRepoImpl ..|> IHealthRepo
+
+WorkoutRepoImpl --> DAOs
+MediaRepoImpl --> DAOs
+HealthRepoImpl --> DAOs
+WorkoutRepoImpl --> Clock
+WorkoutRepoImpl --> Uuid
+WorkoutRepoImpl --> Failure
+
+DAOs --> Drift
+Drift --> SQLite
+
+MediaRepoImpl --> PathResolver
+Capture --> Compressor
+Compressor --> Thumbs
+Compressor --> FileStore
+Thumbs --> FileStore
+PathResolver --> FileStore
+Capture --> DAOs
+
+GHASource ..|> IHealthSource
+HCSource ..|> IHealthSource
+HKSource ..|> IHealthSource
+GHASource --> HealthMappers
+HCSource --> HealthMappers
+HKSource --> HealthMappers
+GHASource --> TokenStore
+GHASource --> GoogleAPI
+HCSource --> HealthConnect
+HKSource --> HealthKit
+
+SyncCoord --> IHealthSource
+SyncCoord --> PriorityResolver
+SyncCoord --> CapReg
+SyncCoord --> DAOs
+CapReg --> IHealthSource
+PriorityResolver --> DAOs
+
+Storage --> FileStore
+Storage --> DAOs
+Export --> SQLite
+Export --> FileStore
+
+' reactive streams (dashed)
+Drift ..> WorkoutRepoImpl : Stream<Row>
+WorkoutRepoImpl ..> Providers : Stream<Entity>
+Providers ..> Screens : AsyncValue
+
+Remote -[#999999]-> Drift : «Phase 4 — writes INTO local»
+
+note bottom of Remote
+  Deferred. When it arrives it writes
+  into Drift. The UI never reads it.
+end note
+
+note right of Drift
+  **THE STRUCTURAL RULE**
+  Drift is the permanent read model.
+  Every UI read comes from here —
+  today and after sync is added.
+end note
+
+note right of HealthMappers
+  Canonical metric model is **ours**.
+  All vendor units, timezones, sleep
+  taxonomies and session enums are
+  normalised here and nowhere else.
+end note
+
+@enduml

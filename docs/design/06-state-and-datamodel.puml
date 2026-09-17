@@ -1,0 +1,194 @@
+@startuml 06-media-state
+' ============================================================
+'  Media attachment lifecycle — persisted, crash-recoverable
+' ============================================================
+
+title Media Attachment — Persisted State Machine
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+
+[*] --> captured : row written\n**before** any processing
+
+captured --> compressing : worker picks up
+compressing --> ready : encode + thumbnail ok
+compressing --> failed : encode error
+
+failed --> compressing : retry (max 3)
+failed --> [*] : user discards
+
+ready --> uploading : «deferred — backup phase»
+uploading --> uploaded : remote_url set
+uploading --> ready : transfer interrupted\n(upload_offset retained)
+uploaded --> evicted : storage budget,\noriginal removed,\nthumbnail retained
+
+evicted --> uploaded : re-fetch on demand
+
+state "recovery on launch" as recovery
+captured --> recovery : app killed mid-flight
+compressing --> recovery : app killed mid-flight
+recovery --> compressing : output missing → re-enqueue
+recovery --> ready : output present → reconcile
+
+note right of recovery
+  OrphanSweeper reconciles DB rows
+  against the filesystem at every launch.
+  Files with no live row are deleted;
+  rows with no output are re-enqueued.
+end note
+
+note bottom
+  States after **ready** are greyed in the first cut —
+  no backend, so nothing uploads. The column exists
+  so the transition is additive later.
+end note
+
+@enduml
+
+
+@startuml 07-data-model
+' ============================================================
+'  Domain / persistence entity relationships
+' ============================================================
+
+title Data Model — Entities & Sync Primitives
+
+skinparam shadowing false
+skinparam defaultFontName "Helvetica"
+skinparam class {
+  BorderColor #444444
+  BackgroundColor #FFFFFF
+}
+hide circle
+
+class SyncPrimitives <<abstract>> #FFFDF0 {
+  id : TEXT «UUIDv7, client-generated»
+  user_id : TEXT = 'local'
+  created_at : INTEGER «UTC epoch ms»
+  updated_at : INTEGER
+  deleted_at : INTEGER «tombstone»
+  sync_state : INTEGER
+  server_rev : INTEGER
+  device_id : TEXT
+}
+
+note right of SyncPrimitives
+  Present on **every** synchronisable table
+  from commit one. BaseDao enforces
+  `deleted_at IS NULL` on reads and bumps
+  `updated_at` on writes.
+end note
+
+class WorkoutSession {
+  started_at : INTEGER
+  ended_at : INTEGER
+  --
+  local_date : TEXT «04:00 boundary»
+  tz_offset_min : INTEGER
+  --
+  workout_type : TEXT
+  title / notes : TEXT
+  perceived_effort : INTEGER
+  status : TEXT «planned|in_progress\n|completed|skipped»
+}
+
+class ExerciseLog {
+  order_index : INTEGER
+  set_index : INTEGER
+  reps : INTEGER
+  weight_kg : REAL «always SI»
+  duration_sec : INTEGER
+  distance_m : REAL
+  rpe : REAL
+  is_warmup : INTEGER
+  rest_sec : INTEGER
+}
+
+class Exercise <<catalogue>> {
+  name : TEXT
+  category : TEXT
+  primary_muscle : TEXT
+  equipment : TEXT
+  is_custom : INTEGER
+}
+
+class MediaAttachment {
+  media_type : TEXT
+  relative_path : TEXT «NEVER absolute»
+  thumb_rel_path : TEXT
+  mime_type / size_bytes
+  width / height / duration_ms
+  checksum_sha256 : TEXT
+  capture_state : TEXT
+  remote_url : TEXT «null in first cut»
+  upload_state / upload_offset
+}
+
+class HealthSnapshot {
+  local_date : TEXT
+  window_start / window_end
+  --
+  steps / active_kcal / total_kcal
+  calorie_basis : TEXT
+  distance_m
+  avg_hr / peak_hr / resting_hr
+  zone_model_version : INTEGER
+  zone_seconds_json : TEXT
+  sleep_minutes
+  coverage : REAL
+  --
+  source_id : TEXT
+  source_package : TEXT
+  source_record_id : TEXT
+  source_modified_at
+  ingested_at
+}
+
+class SourcePriority <<config>> {
+  metric : TEXT
+  source_id : TEXT
+  rank : INTEGER
+}
+
+class HabitDefinition {
+  name : TEXT
+  cadence : TEXT
+  target_count : INTEGER
+  target_days_json : TEXT
+  grace_days : INTEGER = 1
+  active_from / active_to
+}
+
+class SyncCursor <<operational>> {
+  source_id : TEXT «PK»
+  cursor : TEXT
+  last_success_at : INTEGER
+  consecutive_failures : INTEGER
+}
+
+SyncPrimitives <|-- WorkoutSession
+SyncPrimitives <|-- ExerciseLog
+SyncPrimitives <|-- MediaAttachment
+SyncPrimitives <|-- HealthSnapshot
+
+WorkoutSession "1" *-- "0..*" ExerciseLog
+WorkoutSession "1" *-- "0..*" MediaAttachment
+ExerciseLog "1" o-- "0..*" MediaAttachment
+ExerciseLog "*" --> "1" Exercise
+WorkoutSession "1" o-- "0..1" HealthSnapshot : resolved view
+SourcePriority ..> HealthSnapshot : ranks per metric
+
+note bottom of HealthSnapshot
+  **One row per day PER SOURCE**, not one per day.
+  UNIQUE(source_id, source_package, source_record_id)
+  is the dedup mechanism. SnapshotResolver picks the
+  winner per metric — today always the only row.
+end note
+
+note bottom of ExerciseLog
+  One row **per set**. Enables SQL progression
+  queries and per-row conflict resolution later;
+  a JSON blob would force document-level LWW.
+end note
+
+@enduml
