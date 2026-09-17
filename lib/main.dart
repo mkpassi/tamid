@@ -8,6 +8,7 @@ void main() {
 }
 
 class TamidApp extends StatelessWidget {
+
   const TamidApp({super.key});
 
   @override
