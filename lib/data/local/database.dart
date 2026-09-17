@@ -6,8 +6,46 @@ import '../../core/util/ids.dart';
 
 part 'database.g.dart';
 
-const statusAttended = 'attended';
-const statusSkipped = 'skipped';
+/// The answer to "did I train?".
+///
+/// [unanswered] is not a third answer — it is the absence of one, written only
+/// when a note is saved on a day that has no answer yet. Never pass it to
+/// [AppDatabase.mark]; ask [AttendanceDayStatus.isAnswered] instead of
+/// comparing statuses at call sites.
+enum AttendanceStatus {
+  attended('attended'),
+  skipped('skipped'),
+  unanswered('unanswered');
+
+  const AttendanceStatus(this.stored);
+
+  /// The value persisted in SQLite. Never change these strings.
+  final String stored;
+
+  static AttendanceStatus fromStored(String value) => values.firstWhere(
+    (v) => v.stored == value,
+    orElse: () => throw ArgumentError.value(value, 'status', 'unknown status'),
+  );
+}
+
+class _StatusConverter extends TypeConverter<AttendanceStatus, String> {
+  const _StatusConverter();
+
+  @override
+  AttendanceStatus fromSql(String fromDb) => AttendanceStatus.fromStored(fromDb);
+
+  @override
+  String toSql(AttendanceStatus value) => value.stored;
+}
+
+/// The single predicate for "does this day carry an answer". Streak logic and
+/// every future query go through this, never through a status comparison.
+extension AttendanceDayStatus on AttendanceDay {
+  bool get isAnswered => status != AttendanceStatus.unanswered;
+}
+
+/// Longest note we will store. Enforced here, not only in the text field.
+const maxNoteLength = 500;
 
 /// How far back a day may still be answered. An honest streak means you cannot
 /// retroactively fill in last quarter.
@@ -28,6 +66,17 @@ final class InvalidAttendanceDate implements Exception {
   String toString() => 'InvalidAttendanceDate: $message';
 }
 
+/// Thrown when a note exceeds [maxNoteLength]. Truncating silently would lose
+/// the user's words without telling them.
+final class InvalidAttendanceNote implements Exception {
+  const InvalidAttendanceNote(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'InvalidAttendanceNote: $message';
+}
+
 /// One answer per local day: did today count?
 ///
 /// [syncState] and [serverRev] are unused in this iteration. They exist so the
@@ -43,7 +92,8 @@ class AttendanceDays extends Table {
   TextColumn get deviceId => text()();
   TextColumn get localDate => text()(); // 'yyyy-MM-dd', 04:00 boundary
   IntColumn get tzOffsetMin => integer()();
-  TextColumn get status => text()(); // 'attended' | 'skipped'
+  TextColumn get status => text().map(const _StatusConverter())();
+  TextColumn get note => text().nullable()();
   IntColumn get markedAt => integer()(); // UTC epoch ms
   IntColumn get createdAt => integer()();
   IntColumn get updatedAt => integer()();
@@ -77,7 +127,20 @@ class AppDatabase extends _$AppDatabase {
   final IdGenerator ids;
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
+
+  @override
+  MigrationStrategy get migration => MigrationStrategy(
+    onCreate: (m) => m.createAll(),
+    onUpgrade: (m, from, to) async {
+      // `from <` rather than `from ==`: skipping a version is a real case,
+      // including after a gap between installs. Never destructiveFallback —
+      // that silently deletes the data this whole exercise exists to keep.
+      if (from < 2) {
+        await m.addColumn(attendanceDays, attendanceDays.note);
+      }
+    },
+  );
 
   /// The single place the tombstone filter is applied, so no read can forget.
   Expression<bool> _alive($AttendanceDaysTable t) => t.deletedAt.isNull();
@@ -141,8 +204,16 @@ class AppDatabase extends _$AppDatabase {
   /// rather than adding a second row. Bumps [updatedAt] on every write.
   Future<void> mark({
     required String localDate,
-    required String status,
+    required AttendanceStatus status,
   }) async {
+    if (status == AttendanceStatus.unanswered) {
+      throw ArgumentError.value(
+        status,
+        'status',
+        'unanswered is the absence of an answer, never a choice. It is written '
+            'only by setNote when a day has no answer yet.',
+      );
+    }
     _validateDate(localDate);
     final now = clock.nowUtcMillis();
     final device = await deviceId();
@@ -166,6 +237,59 @@ class AppDatabase extends _$AppDatabase {
         (old) => AttendanceDaysCompanion(
           status: Value(status),
           markedAt: Value(now),
+          updatedAt: Value(now),
+        ),
+        target: [attendanceDays.userId, attendanceDays.localDate],
+        targetCondition: (t) => t.deletedAt.isNull(),
+      ),
+    );
+  }
+
+  /// Empty and whitespace-only notes are indistinguishable from no note at
+  /// all, so they normalise to null here — the one place that decision lives.
+  String? _normaliseNote(String? note) {
+    final trimmed = note?.trim() ?? '';
+    if (trimmed.isEmpty) return null;
+    if (trimmed.length > maxNoteLength) {
+      throw InvalidAttendanceNote(
+        'Note is ${trimmed.length} characters; the maximum is $maxNoteLength.',
+      );
+    }
+    return trimmed;
+  }
+
+  /// Sets or clears a day's note, independently of its status.
+  ///
+  /// A day with something worth saying but no answer yet is a real case — "I
+  /// couldn't train, here's why" — so this creates the row with
+  /// [AttendanceStatus.unanswered] when none exists. That is the only code
+  /// path that ever writes that value.
+  Future<void> setNote({
+    required String localDate,
+    required String? note,
+  }) async {
+    _validateDate(localDate);
+    final normalised = _normaliseNote(note);
+    final now = clock.nowUtcMillis();
+    final device = await deviceId();
+    await into(attendanceDays).insert(
+      AttendanceDaysCompanion.insert(
+        id: ids.generate(),
+        deviceId: device,
+        localDate: localDate,
+        tzOffsetMin: clock.tzOffsetMinutes(
+          clock.dateTimeForLocalDate(localDate),
+        ),
+        status: AttendanceStatus.unanswered,
+        markedAt: now,
+        createdAt: now,
+        updatedAt: now,
+        note: Value(normalised),
+      ),
+      // Only the note moves: an existing answer is left exactly as it was.
+      onConflict: DoUpdate(
+        (old) => AttendanceDaysCompanion(
+          note: Value(normalised),
           updatedAt: Value(now),
         ),
         target: [attendanceDays.userId, attendanceDays.localDate],

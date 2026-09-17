@@ -75,7 +75,7 @@ class _Loaded extends ConsumerWidget {
           child: Text(
             todayRow == null
                 ? 'Did you train today?'
-                : todayRow.status == statusAttended
+                : todayRow.status == AttendanceStatus.attended
                 ? 'You trained today.'
                 : 'You sat today out.',
             style: Theme.of(context).textTheme.headlineMedium,
@@ -88,8 +88,8 @@ class _Loaded extends ConsumerWidget {
               Expanded(
                 child: _AnswerButton(
                   label: 'Yes',
-                  status: statusAttended,
-                  selected: todayRow?.status == statusAttended,
+                  status: AttendanceStatus.attended,
+                  selected: todayRow?.status == AttendanceStatus.attended,
                   localDate: today,
                 ),
               ),
@@ -97,14 +97,22 @@ class _Loaded extends ConsumerWidget {
               Expanded(
                 child: _AnswerButton(
                   label: 'Not today',
-                  status: statusSkipped,
-                  selected: todayRow?.status == statusSkipped,
+                  status: AttendanceStatus.skipped,
+                  selected: todayRow?.status == AttendanceStatus.skipped,
                   localDate: today,
                 ),
               ),
             ],
           ),
         ),
+        if (todayRow?.note != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 20, 24, 0),
+            child: Text(
+              todayRow!.note!,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ),
         const SizedBox(height: 24),
         const Divider(height: 1),
         Expanded(
@@ -126,7 +134,7 @@ class _AnswerButton extends ConsumerWidget {
   });
 
   final String label;
-  final String status;
+  final AttendanceStatus status;
   final bool selected;
   final String localDate;
 
@@ -205,7 +213,7 @@ class _Calendar extends ConsumerWidget {
 
     final attended = [
       for (var day = 1; day <= daysInMonth; day++) dateOf(day),
-    ].where((d) => byDate[d]?.status == statusAttended).length;
+    ].where((d) => byDate[d]?.status == AttendanceStatus.attended).length;
     // Current month is judged on days elapsed; a past month on its full length.
     final denominator = offset == 0 ? todayDt.day : daysInMonth;
 
@@ -298,8 +306,8 @@ class _DayCell extends ConsumerWidget {
     final tooOld = date.compareTo(earliest) < 0;
     final editable = !isFuture && !tooOld;
 
-    final attended = row?.status == statusAttended;
-    final skipped = row?.status == statusSkipped;
+    final attended = row?.status == AttendanceStatus.attended;
+    final skipped = row?.status == AttendanceStatus.skipped;
 
     final Color background = attended ? scheme.primary : Colors.transparent;
     final Color border = isToday
@@ -333,15 +341,35 @@ class _DayCell extends ConsumerWidget {
                 width: isToday ? 2.5 : 1.5,
               ),
             ),
-            child: Center(
-              child: Text(
-                '$day',
-                style: TextStyle(
-                  color: text,
-                  fontWeight: isToday ? FontWeight.bold : FontWeight.normal,
-                  decoration: skipped ? TextDecoration.lineThrough : null,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                Text(
+                  '$day',
+                  style: TextStyle(
+                    color: text,
+                    fontWeight: isToday ? FontWeight.bold : FontWeight.normal,
+                    decoration: skipped ? TextDecoration.lineThrough : null,
+                  ),
                 ),
-              ),
+                // Secondary information: must not compete with attended /
+                // skipped, which is what the grid exists to convey.
+                if (row?.note != null)
+                  Align(
+                    alignment: Alignment.bottomCenter,
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Container(
+                        width: 4,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: attended ? scheme.onPrimary : scheme.outline,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
         ),
@@ -356,50 +384,123 @@ Future<void> _openDaySheet(
   required String date,
   required AttendanceDay? row,
 }) {
-  final db = ref.read(databaseProvider);
-
   return showModalBottomSheet<void>(
     context: context,
-    builder: (sheetContext) => SafeArea(
+    isScrollControlled: true,
+    builder: (sheetContext) => Padding(
+      // Lift the sheet above the keyboard when the note field has focus.
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(sheetContext).viewInsets.bottom,
+      ),
+      child: _DaySheet(date: date, row: row),
+    ),
+  );
+}
+
+class _DaySheet extends ConsumerStatefulWidget {
+  const _DaySheet({required this.date, required this.row});
+
+  final String date;
+  final AttendanceDay? row;
+
+  @override
+  ConsumerState<_DaySheet> createState() => _DaySheetState();
+}
+
+class _DaySheetState extends ConsumerState<_DaySheet> {
+  late final TextEditingController _note = TextEditingController(
+    text: widget.row?.note ?? '',
+  );
+
+  @override
+  void dispose() {
+    _note.dispose();
+    super.dispose();
+  }
+
+  /// Saving is explicit — dismissing writes nothing, since back gestures and
+  /// backdrop taps would otherwise save on cancel. Answering a status still
+  /// carries any typed note along, so an answer never discards words.
+  Future<void> _persistNote(AppDatabase db) async {
+    if (_note.text.trim() == (widget.row?.note ?? '')) return;
+    await db.setNote(localDate: widget.date, note: _note.text);
+  }
+
+  Future<void> _answer(AttendanceStatus status) async {
+    final db = ref.read(databaseProvider);
+    final navigator = Navigator.of(context);
+    await _persistNote(db);
+    await db.mark(localDate: widget.date, status: status);
+    navigator.pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final db = ref.read(databaseProvider);
+
+    return SafeArea(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
             child: Text(
-              date,
-              style: Theme.of(sheetContext).textTheme.titleMedium,
+              widget.date,
+              style: Theme.of(context).textTheme.titleMedium,
             ),
           ),
           ListTile(
             leading: const Icon(Icons.check_circle_outline),
             title: const Text('Yes'),
-            onTap: () {
-              db.mark(localDate: date, status: statusAttended);
-              Navigator.of(sheetContext).pop();
-            },
+            onTap: () => _answer(AttendanceStatus.attended),
           ),
           ListTile(
             leading: const Icon(Icons.remove_circle_outline),
             title: const Text('Not today'),
-            onTap: () {
-              db.mark(localDate: date, status: statusSkipped);
-              Navigator.of(sheetContext).pop();
-            },
+            onTap: () => _answer(AttendanceStatus.skipped),
           ),
-          if (row != null)
+          if (widget.row != null)
             ListTile(
               leading: const Icon(Icons.backspace_outlined),
               title: const Text('Clear'),
-              onTap: () {
+              onTap: () async {
+                final navigator = Navigator.of(context);
                 // Tombstone, not a delete.
-                db.clearDay(date);
-                Navigator.of(sheetContext).pop();
+                await db.clearDay(widget.date);
+                navigator.pop();
               },
             ),
-          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
+            child: TextField(
+              controller: _note,
+              minLines: 2,
+              maxLines: 4,
+              maxLength: maxNoteLength,
+              decoration: const InputDecoration(
+                hintText: 'What happened?',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 16),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: () async {
+                    final navigator = Navigator.of(context);
+                    await _persistNote(db);
+                    navigator.pop();
+                  },
+                  child: const Text('Save note'),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
-    ),
-  );
+    );
+  }
 }

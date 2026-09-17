@@ -15,12 +15,12 @@ void main() {
     final db = buildDb();
     addTearDown(db.close);
 
-    await db.mark(localDate: '2026-09-16', status: statusAttended);
-    await db.mark(localDate: '2026-09-16', status: statusSkipped);
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.attended);
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.skipped);
 
     final rows = await db.watchRecent().first;
     expect(rows, hasLength(1));
-    expect(rows.single.status, statusSkipped);
+    expect(rows.single.status, AttendanceStatus.skipped);
   });
 
   test('mark rejects a date after today', () async {
@@ -28,7 +28,7 @@ void main() {
     addTearDown(db.close);
 
     expect(
-      () => db.mark(localDate: '2026-09-17', status: statusAttended),
+      () => db.mark(localDate: '2026-09-17', status: AttendanceStatus.attended),
       throwsA(isA<InvalidAttendanceDate>()),
     );
   });
@@ -39,12 +39,12 @@ void main() {
 
     // 31 days back — outside.
     expect(
-      () => db.mark(localDate: '2026-08-16', status: statusAttended),
+      () => db.mark(localDate: '2026-08-16', status: AttendanceStatus.attended),
       throwsA(isA<InvalidAttendanceDate>()),
     );
 
     // 29 days back — inside.
-    await db.mark(localDate: '2026-08-18', status: statusAttended);
+    await db.mark(localDate: '2026-08-18', status: AttendanceStatus.attended);
     final rows = await db.watchRecent().first;
     expect(rows.single.localDate, '2026-08-18');
   });
@@ -60,7 +60,7 @@ void main() {
     final db = buildDb(clock: clock);
     addTearDown(db.close);
 
-    await db.mark(localDate: '2026-03-05', status: statusAttended);
+    await db.mark(localDate: '2026-03-05', status: AttendanceStatus.attended);
 
     final rows = await db.watchRecent().first;
     expect(rows.single.tzOffsetMin, 60, reason: "today's offset is 120");
@@ -70,16 +70,86 @@ void main() {
     final db = buildDb();
     addTearDown(db.close);
 
-    await db.mark(localDate: '2026-09-16', status: statusAttended);
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.attended);
     await db.clearDay('2026-09-16');
     expect(await db.watchRecent().first, isEmpty);
 
     // The tombstoned row is exempt from the partial unique index, so this
     // must insert cleanly rather than hit a constraint violation.
-    await db.mark(localDate: '2026-09-16', status: statusSkipped);
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.skipped);
 
     final live = await db.watchRecent().first;
     expect(live, hasLength(1));
-    expect(live.single.status, statusSkipped);
+    expect(live.single.status, AttendanceStatus.skipped);
+  });
+
+  test('a whitespace-only note is stored as null', () async {
+    final db = buildDb();
+    addTearDown(db.close);
+
+    await db.setNote(localDate: '2026-09-16', note: '   \n  ');
+
+    final rows = await db.watchRecent().first;
+    expect(rows.single.note, isNull);
+    expect(rows.single.isAnswered, isFalse, reason: 'note without an answer');
+  });
+
+  test('note and status are independent of each other', () async {
+    final db = buildDb();
+    addTearDown(db.close);
+
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.attended);
+    await db.setNote(localDate: '2026-09-16', note: 'shoulder felt off');
+    expect((await db.watchRecent().first).single.status,
+        AttendanceStatus.attended);
+
+    // Changing the status must not wipe the note.
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.skipped);
+
+    final row = (await db.watchRecent().first).single;
+    expect(row.status, AttendanceStatus.skipped);
+    expect(row.note, 'shoulder felt off');
+  });
+
+  test('clearing a day does not resurrect its note', () async {
+    final db = buildDb();
+    addTearDown(db.close);
+
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.attended);
+    await db.setNote(localDate: '2026-09-16', note: 'good session');
+    await db.clearDay('2026-09-16');
+
+    // Clear means "this day has no record"; a note surviving it would surprise.
+    await db.mark(localDate: '2026-09-16', status: AttendanceStatus.attended);
+
+    final rows = await db.watchRecent().first;
+    expect(rows, hasLength(1));
+    expect(rows.single.note, isNull);
+  });
+
+  test('mark refuses to write unanswered', () async {
+    final db = buildDb();
+    addTearDown(db.close);
+
+    expect(
+      () => db.mark(
+        localDate: '2026-09-16',
+        status: AttendanceStatus.unanswered,
+      ),
+      throwsA(isA<ArgumentError>()),
+    );
+  });
+
+  test('an over-long note is rejected, not truncated', () async {
+    final db = buildDb();
+    addTearDown(db.close);
+
+    expect(
+      () => db.setNote(
+        localDate: '2026-09-16',
+        note: 'x' * (maxNoteLength + 1),
+      ),
+      throwsA(isA<InvalidAttendanceNote>()),
+    );
   });
 }

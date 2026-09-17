@@ -51,6 +51,10 @@ app.*.map.json
 .fvm/
 
 # codegen
+# NOTE: drift_schemas/ and test/generated_migrations/ look generated but are
+# deliberately TRACKED. The snapshots are the only record of what each past
+# schema version looked like; lose them and no future migration can be tested
+# against real historical data. Do not add them here.
 *.g.dart
 *.drift.dart
 *.freezed.dart
