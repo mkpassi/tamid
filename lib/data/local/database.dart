@@ -9,7 +9,24 @@ part 'database.g.dart';
 const statusAttended = 'attended';
 const statusSkipped = 'skipped';
 
+/// How far back a day may still be answered. An honest streak means you cannot
+/// retroactively fill in last quarter.
+const backfillWindowDays = 30;
+
 const _deviceIdKey = 'device_id';
+
+final _localDatePattern = RegExp(r'^\d{4}-\d{2}-\d{2}$');
+
+/// Thrown when a write names a date that is malformed, in the future, or older
+/// than the backfill window. Deliberately one class, not a hierarchy.
+final class InvalidAttendanceDate implements Exception {
+  const InvalidAttendanceDate(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'InvalidAttendanceDate: $message';
+}
 
 /// One answer per local day: did today count?
 ///
@@ -65,6 +82,46 @@ class AppDatabase extends _$AppDatabase {
   /// The single place the tombstone filter is applied, so no read can forget.
   Expression<bool> _alive($AttendanceDaysTable t) => t.deletedAt.isNull();
 
+  /// The oldest date still editable, inclusive.
+  String earliestEditableDate() {
+    final today = clock.dateTimeForLocalDate(clock.today());
+    return clock.localDateFor(
+      DateTime(
+        today.year,
+        today.month,
+        today.day - backfillWindowDays,
+        dayBoundaryHour,
+      ),
+    );
+  }
+
+  /// Guards every write. The UI disables ineligible days, but disabled buttons
+  /// are not validation — this is.
+  void _validateDate(String localDate) {
+    if (!_localDatePattern.hasMatch(localDate)) {
+      throw InvalidAttendanceDate('"$localDate" is not yyyy-MM-dd.');
+    }
+    // Round-trip: DateTime(2026, 2, 31) silently rolls into March, so a date
+    // that does not format back to itself was never a real date.
+    if (clock.localDateFor(clock.dateTimeForLocalDate(localDate)) !=
+        localDate) {
+      throw InvalidAttendanceDate('"$localDate" is not a real calendar date.');
+    }
+    // 'yyyy-MM-dd' sorts lexicographically, so string comparison is date
+    // comparison.
+    final today = clock.today();
+    if (localDate.compareTo(today) > 0) {
+      throw InvalidAttendanceDate('"$localDate" is in the future.');
+    }
+    final earliest = earliestEditableDate();
+    if (localDate.compareTo(earliest) < 0) {
+      throw InvalidAttendanceDate(
+        '"$localDate" is older than the $backfillWindowDays-day '
+        'backfill window (earliest is $earliest).',
+      );
+    }
+  }
+
   Stream<List<AttendanceDay>> watchRecent({int limit = 60}) {
     final q = select(attendanceDays)
       ..where(_alive)
@@ -86,6 +143,7 @@ class AppDatabase extends _$AppDatabase {
     required String localDate,
     required String status,
   }) async {
+    _validateDate(localDate);
     final now = clock.nowUtcMillis();
     final device = await deviceId();
     await into(attendanceDays).insert(
@@ -93,7 +151,12 @@ class AppDatabase extends _$AppDatabase {
         id: ids.generate(),
         deviceId: device,
         localDate: localDate,
-        tzOffsetMin: clock.tzOffsetMinutes(clock.nowUtc()),
+        // The offset in force on THAT date, not today's. Backfilling across a
+        // DST or travel boundary stores the wrong offset otherwise, and it is
+        // unrecoverable afterwards.
+        tzOffsetMin: clock.tzOffsetMinutes(
+          clock.dateTimeForLocalDate(localDate),
+        ),
         status: status,
         markedAt: now,
         createdAt: now,
@@ -107,6 +170,23 @@ class AppDatabase extends _$AppDatabase {
         ),
         target: [attendanceDays.userId, attendanceDays.localDate],
         targetCondition: (t) => t.deletedAt.isNull(),
+      ),
+    );
+  }
+
+  /// Removes a day's answer by tombstone, never by DELETE.
+  ///
+  /// The unique index is partial (`WHERE deleted_at IS NULL`), so the cleared
+  /// row stops participating and the day can be answered again cleanly.
+  Future<void> clearDay(String localDate) async {
+    _validateDate(localDate);
+    final now = clock.nowUtcMillis();
+    final q = update(attendanceDays)
+      ..where((t) => _alive(t) & t.localDate.equals(localDate));
+    await q.write(
+      AttendanceDaysCompanion(
+        deletedAt: Value(now),
+        updatedAt: Value(now),
       ),
     );
   }

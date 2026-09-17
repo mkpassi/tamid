@@ -21,6 +21,12 @@ abstract interface class Clock {
   /// Today's local date under the 04:00 boundary.
   String today();
 
+  /// The local [DateTime] a `yyyy-MM-dd` string denotes, at the day boundary.
+  ///
+  /// Needed to recover the UTC offset that was in force on a past date, which
+  /// is not the same as today's offset once travel or DST intervenes.
+  DateTime dateTimeForLocalDate(String localDate);
+
   /// Minutes offset from UTC at the given moment.
   int tzOffsetMinutes(DateTime moment);
 }
@@ -45,6 +51,17 @@ mixin ClockDateMath implements Clock {
     return '${day.year.toString().padLeft(4, '0')}-'
         '${day.month.toString().padLeft(2, '0')}-'
         '${day.day.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  DateTime dateTimeForLocalDate(String localDate) {
+    final parts = localDate.split('-');
+    return DateTime(
+      int.parse(parts[0]),
+      int.parse(parts[1]),
+      int.parse(parts[2]),
+      dayBoundaryHour,
+    );
   }
 
   @override
